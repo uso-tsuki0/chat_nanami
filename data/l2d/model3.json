@@ -1,0 +1,64 @@
+{
+    "Version": 3,
+    "FileReferences": {
+        "Moc": "FileReferences_Moc_0.moc3",
+        "Textures": ["FileReferences_Textures_0_0.png"],
+        "Physics": "FileReferences_Physics_0.json",
+        "Expressions": [
+            {
+                "Name": "F01",
+                "File": "expressions/F01.exp3.json"
+            },
+            {
+                "Name": "F02",
+                "File": "expressions/F02.exp3.json"
+            },
+            {
+                "Name": "F03",
+                "File": "expressions/F03.exp3.json"
+            },
+            {
+                "Name": "F04",
+                "File": "expressions/F04.exp3.json"
+            },
+            {
+                "Name": "F05",
+                "File": "expressions/F05.exp3.json"
+            },
+            {
+                "Name": "F06",
+                "File": "expressions/F06.exp3.json"
+            },
+            {
+                "Name": "F07",
+                "File": "expressions/F07.exp3.json"
+            },
+            {
+                "Name": "F08",
+                "File": "expressions/F08.exp3.json"
+            }
+        ],
+        "Motions": {
+            "Idle#1": [{"File": "FileReferences_Motions_Idle#1_0_File_0.json"}],
+            "Taptou": [{"File": "FileReferences_Motions_Taptou_0_File_0.json"}],
+            "Tapxiong": [{"File": "FileReferences_Motions_Tapxiong_0_File_0.json"}],
+            "Tapfu": [{"File": "FileReferences_Motions_Tapfu_0_File_0.json"}],
+            "Taptui": [{"File": "FileReferences_Motions_Taptui_0_File_0.json"}],
+            "TapZT": [
+                {"File": "FileReferences_Motions_TapZT_0_File_0.json"},
+                {"File": "FileReferences_Motions_TapZT_1_File_0.json"},
+                {"File": "FileReferences_Motions_TapZT_2_File_0.json"},
+                {"File": "FileReferences_Motions_TapZT_3_File_0.json"}
+            ],
+            "Start": [
+                {"File": "FileReferences_Motions_Start_0_File_0.json"}
+            ],
+            "Leave30_20_30": [
+                {"File": "FileReferences_Motions_Leave30_20_30_0_File_0.json"},
+                {"File": "FileReferences_Motions_Leave30_20_30_1_File_0.json"},
+                {"File": "FileReferences_Motions_Leave30_20_30_2_File_0.json"}
+            ]
+        }
+    },
+    "Groups": []
+}
