@@ -53,8 +53,10 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from langchain_deepseek import ChatDeepSeek
 from langchain_community.llms.moonshot import Moonshot
-
-
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import uvicorn
+from langserve import add_routes
 
 
 from parser import BaseParser
@@ -112,7 +114,7 @@ class RetrieveTool(BaseTool):
         map["query"] = query
         for i, doc in enumerate(docs):
             map[f"doc_{i}"] = doc
-        return json.dumps(map, ensure_ascii=False)
+        return map
 
     def _run(self, query: str) -> str:
         """
@@ -178,13 +180,16 @@ class BaseConversation():
             self.config, stream_mode="values"
         )
         return events
-    
+
 
 class NonMemoryState(TypedDict):
     """The state of the agent."""
     messages: List[BaseMessage]
+    sys_messages: List[BaseMessage]
     question: str
+    retrieval_cache: List[str]
     analysis: str
+    retry_count: int
 
 
 class ProblemAnalysis(BaseModel):
@@ -199,7 +204,7 @@ class ProblemAnalysis(BaseModel):
 class GradeDocuments(BaseModel):
     """Binary score for relevance check on retrieved documents."""
     binary_score: str = Field(
-        description="Documents are relevant to the question, 'yes' or 'no'"
+        description="Documents might be relevant to the question, 'true' or 'false'"
     )
 
 
@@ -209,15 +214,15 @@ class CustomMemorySaver(MemorySaver):
 
 
 class AgentRagConversation(BaseConversation):
-    def __init__(self, model, user_id, retriever, memory_max_step=1):
+    def __init__(self, model, user_id, retriever, memory_max_step=1, retry_limit=3):
         self.checkpointer = CustomMemorySaver()
         super().__init__(model, user_id, retriever)
 
     def add_tools(self):
         self.local_rag_tools = [RetrieveTool(self.retriever)]
-        self.online_rearch_tools = [TavilySearchResults(k=5)]
+        self.online_rag_tools = [TavilySearchResults(k=5)]
         self.tool_map = {tool.name: tool for tool in self.local_rag_tools}
-        self.tool_map.update({tool.name: tool for tool in self.online_rearch_tools})
+        self.tool_map.update({tool.name: tool for tool in self.online_rag_tools})
         self.llm_with_local_rag_tools = self.llm.bind_tools(self.local_rag_tools)
      
     
@@ -230,7 +235,7 @@ class AgentRagConversation(BaseConversation):
         # 处理流程
         1. 问题拆解
         - 理解问题的核心意图和背景。
-        - 将问题拆解为多个子问题。
+        - 将问题拆解为若干个子问题。
         - 明确子问题与主问题的逻辑关系。
         2. 信息需求
         - 明确每个子问题需要哪些具体信息。
@@ -238,57 +243,65 @@ class AgentRagConversation(BaseConversation):
         - 根据信息需求，提出具体的查询语句
          
         # 输出规范
-        - 确保子问题之间没有过多的重叠。
-        - 保持逻辑严谨
+        - 确保子问题不多于3个。
+        - 尽量保持查询内容相互独立。
+        - 保持逻辑严谨。
         """),
         
         ('human', '{human_input}')
         ])
         cot_chain = prompt_template | self.llm.with_structured_output(ProblemAnalysis)
-        question = state["messages"][-1].content
+        if "sys_messages" in state and state["sys_messages"]:
+            question = state["sys_messages"][-1].content
+        else:
+            question = state["messages"][-1].content
         response = cot_chain.invoke({'human_input': question})
         info_requirements = AIMessage(content=response.information_requirements)
         analysis = response.problem_decomposition
         queries = AIMessage(content=response.queries)
         return {
-            "messages": [queries],
+            "messages": [AIMessage("Analyzing the question ...")],
+            "sys_messages": [queries],
             "question": question,
             "analysis": analysis,
         }
 
 
-    def router(self, state: NonMemoryState):
+    def router_local(self, state: NonMemoryState):
         prompt_template = ChatPromptTemplate.from_messages([
             ('system', """
             You are a professional tool invocation expert. Your task is to generate precise tool invocation instructions based on the queries.
             """),
             ('human', 'queries: {queries}')
         ])
-        queries = state["messages"][-1].content
+        queries = state["sys_messages"][-1].content
         question = state["question"]
         tools_chain = prompt_template | self.llm_with_local_rag_tools
         response = tools_chain.invoke({'queries': queries})
         return {
-            "messages": [response],
+            "messages": [AIMessage("Routing tools ...")],
+            "sys_messages": [response],
             "question": question,
             "analysis": state["analysis"]
         }
+        
     
 
     def tool_node(self, state: NonMemoryState):
         outputs = []
         question = state["question"]
-        for tool_call in state["messages"][-1].tool_calls:
+        for tool_call in state["sys_messages"][-1].tool_calls:
             tool_result = self.tool_map[tool_call["name"]].invoke(tool_call["args"])
             outputs.append(
                 ToolMessage(
-                    content=json.dumps(tool_result),
+                    content=json.dumps(tool_result, ensure_ascii=False),
                     name=tool_call["name"],
                     tool_call_id=tool_call["id"],
                 )
             )
         return {
-            "messages": outputs,
+            "messages": [AIMessage("Invoking tools ...")],
+            "sys_messages": outputs,
             "question": question,
             "analysis": state["analysis"]
         }
@@ -304,24 +317,30 @@ class AgentRagConversation(BaseConversation):
 
     def document_filter(self, state: NonMemoryState):
         structured_llm_grader = self.llm.with_structured_output(GradeDocuments)
-        system = """\
-            You are a document evaluation expert responsible for assessing the relevance of retrieved documents to user questions.\
-            Your task is to evaluate each document based on the following criteria:\
-            - If the document contains keywords or semantic information related to the user question or the query, evaluate it as "true".\
-            - If the document is unrelated to the user question or contains inaccurate information, evaluate it as "false".\
-            Ensure that your evaluation is based on the content of the document and its relevance to the user question.\
+        system = """
+        You are a document evaluation expert. Your goal is to determine if a retrieved document
+        contains any information that might be relevant to the user query or question.
+
+        Evaluation criteria:
+        1) If a document has any potential connection to the query or question—no matter how small—mark it as "true".
+        2) Only mark it as "false" if you are certain it is completely unrelated.
+        3) When in doubt, lean towards "true".
+
+        Keep your reasoning concise and strictly follow the above criteria.
         """
+
         grade_prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", system),
-                ("human", "Retrieved document: \n\n {document} \n\n User question: {question} \n \n query: {subquery}"),
+                ("human", "Retrieved document: \n\n {document} \n\n Query: {subquery} \n\n User question: {question}"),
             ]
         )
         retrieval_grader = grade_prompt | structured_llm_grader
         response = []
+        retrival_cache = state.get("retrieval_cache", [])
         question = state["question"]
-        for map_str in state["messages"]:
-            map = json.loads(json.loads(map_str.content))
+        for map_str in state["sys_messages"]:
+            map = json.loads(map_str.content)
             query = map["query"]
             documents = []
             for key in map:
@@ -332,15 +351,31 @@ class AgentRagConversation(BaseConversation):
                 doc_response = retrieval_grader.invoke(
                     {"document": doc, "question": question, "subquery": query}
                 )
-                if doc_response.binary_score == "yes":
+                if doc_response.binary_score != "false":
                     relative_docs.append(doc)
-            response_str = (self.formatting_results(query, relative_docs))
-            response.append(AIMessage(content=response_str))
+            print(f"relative_docs: {relative_docs}")
+            if relative_docs:
+                response_str = (self.formatting_results(query, relative_docs))
+                retrival_cache.append(AIMessage(content=response_str))
+            else:
+                response_str = (self.formatting_results(query, []))
+                response.append(AIMessage(content=response_str))
         return {
-            "messages": response,
+            "messages": [AIMessage("Filtering retrieved documents ...")],
+            "sys_messages": response,
             "question": question,
+            "retrieval_cache": retrival_cache,
             "analysis": state["analysis"]
         }
+
+    
+    def online_search_judge(self, state: NonMemoryState):
+        retry_count = state.get("retry_count", 0)
+        if state["sys_messages"] and retry_count < 3:
+            return True
+        return False
+        
+
     
 
     def online_search(self, state: NonMemoryState):
@@ -349,12 +384,21 @@ class AgentRagConversation(BaseConversation):
         If there is no document for the query after filtering, search for additional information online.
         If there are documents, skip this step.
         """
-        for map in state["messages"]:
+        response = []
+        for map in state["sys_messages"]:
             map = json.loads(map.content)
             query = map["query"]
-            if len(map) == 1:
-                search_results = self.tool_map["TavilySearchResults"].invoke({"query": query})
-                return {"messages": [AIMessage(json.dumps(search_results))], "question": state["question"], "analysis": state["analysis"]}
+            docs = [doc['content'] for doc in self.online_rag_tools[0].invoke(query)]
+            response_str = self.formatting_results(query, docs)
+            response.append(AIMessage(content=response_str))
+        return {
+            "messages": [AIMessage("Searching for information online ...")],
+            "sys_messages": response,
+            "question": state["question"],
+            "retrieval_cache": state["retrieval_cache"],
+            "analysis": state["analysis"],
+            "retry_count": state.get("retry_count", 0) + 1
+        }
 
 
     def summarizer(self, state: NonMemoryState):
@@ -364,7 +408,7 @@ class AgentRagConversation(BaseConversation):
         ])
         summary_chain = prompt_template | self.llm
         response = []
-        for map in state['messages']:
+        for map in state["retrieval_cache"]:
             map = json.loads(map.content)
             query = map["query"]
             documents = []
@@ -375,29 +419,48 @@ class AgentRagConversation(BaseConversation):
             summary = summary_chain.invoke({'query': query, 'documents': documents}).content
             content = f"Query: {query} \n Summary: {summary}"
             response.append(content)
-        return {"messages": [AIMessage('\n'.join(response))], "question": state["question"], "analysis": state["analysis"]}
+        return {
+            "messages": [AIMessage("Summarizing retrieved documents ...")],
+            "sys_messages": [AIMessage('\n'.join(response))],
+            "question": state["question"],
+            "analysis": state["analysis"]}
 
 
     def answer(self, state: NonMemoryState):
+        print('answering the question ...')
         prompt_template = ChatPromptTemplate.from_messages([
-            ('system', """You are an expert at reasoning with retrieved documents to answer complex questions."""),
-            ('human', "Question: \n \n {question} \n \n Question Decomposition: \n \n {question_analysis} \n \n Information Retrieved: \n \n {documents}")
+            ('system', "你是一名能够使用检索到的文档进行深入推理，并准确回答复杂问题的专家。"),
+            ('human', """问题：
+            {question}
+
+            问题分解：
+            {question_analysis}
+
+            检索到的信息：
+            {documents}
+
+            请基于以上内容进行分析推理，得出内容准确且逻辑严谨的答案。""")
         ])
+
         question = state["question"]
         question_analysis = state["analysis"]
-        documents = state["messages"][-1].content
+        documents = state["sys_messages"][-1].content
         answer_chain = prompt_template | self.llm
         response = answer_chain.invoke({'question': question, 'question_analysis': question_analysis, 'documents': documents})
-        return {"messages": [HumanMessage(question), response]}
+        return {
+            #"messages": [HumanMessage(question), response]
+            "messages": [response]
+        }
     
 
     def build_graph(self):
         graph_builder = StateGraph(NonMemoryState)
         #node
         graph_builder.add_node("analyzer", self.analyzer_v1)
-        graph_builder.add_node("router", self.router)
+        graph_builder.add_node("router", self.router_local)
         graph_builder.add_node("tools", self.tool_node)
         graph_builder.add_node("filter", self.document_filter)
+        graph_builder.add_node("online_search", self.online_search)
         graph_builder.add_node("summarizer", self.summarizer)
         graph_builder.add_node("answer", self.answer)
         #edge
@@ -405,19 +468,82 @@ class AgentRagConversation(BaseConversation):
         graph_builder.add_edge("analyzer", "router")
         graph_builder.add_edge("router", "tools")
         graph_builder.add_edge("tools", "filter")
-        graph_builder.add_edge("filter", "summarizer")
+        graph_builder.add_conditional_edges(
+            "filter",
+            self.online_search_judge,
+            {
+                True: "online_search",
+                False: "summarizer"
+            }
+        )
+        graph_builder.add_edge("online_search", "filter")
         graph_builder.add_edge("summarizer", "answer")
+        graph_builder.add_edge("answer", END)
         self.graph = graph_builder.compile(checkpointer=self.checkpointer)
 
+
     
-    def input(self, user_input):
+    def invoke(self, user_input):
         init_state = {
-            "messages": [HumanMessage(content=user_input)],
+            "sys_messages": [HumanMessage(content=user_input)],
         } 
         events = self.graph.invoke(
             init_state, self.config, stream_mode="values"
         )
         return events
+
+
+    def stream_server(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        endpoint: str = "/chat",
+        config_keys: list = ["configurable"]
+    ):
+        """
+        一键部署服务
+        :param host: 监听地址
+        :param port: 监听端口
+        :param endpoint: API端点路径
+        :param config_keys: 需要透传的配置键
+        """
+        # 创建FastAPI应用
+        app = FastAPI(
+            title="RAG对话服务",
+            description="基于LangChain和LangServe的流式对话系统"
+        )
+
+        # 添加LangChain图路由
+        add_routes(
+            app,
+            self.graph.with_config(
+                configurable={
+                    "user_id": "default_user"  # 默认配置
+                }
+            ),
+            path=endpoint,
+            config_keys=config_keys,
+            enabled_endpoints=["stream", "invoke", "playground"]
+        )
+
+        # 保持服务器引用
+        self._server = uvicorn.Server(
+            config=uvicorn.Config(
+                app,
+                host=host,
+                port=port,
+                log_level="info"
+            )
+        )
+        
+        # 启动服务
+        self._server.run()
+
+    @property
+    def runnable(self):
+        """获取可直接部署的Runnable对象"""
+        return self.graph.with_config(configurable={"user_id": "default_user"})
+        
 
 
 
@@ -492,7 +618,7 @@ if __name__ == '__main__':
         temperature=0,
     )"""
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4o",
         temperature=0,
     )
 

@@ -15,8 +15,9 @@ class BaseParser:
                 return tuple
 
     def parse_diaologue(self, map):
+        character = map[0]
         diaologue_tuple = map[1]
-        character = diaologue_tuple[2][0]
+        #character = diaologue_tuple[2][0]
         if character is None:
             character = 'user throught'
         text_jp = diaologue_tuple[0][1]
@@ -36,8 +37,18 @@ class BaseParser:
         else:
             return None
         
-    def parse_face(self, map):
+    def parse_face_v1(self, map):
         face_tuple = self.find_tuple(map[4]['data'], 'face')
+        if not face_tuple:
+            return None
+        show_mode = face_tuple[2].get('showmode', None)
+        if show_mode and show_mode != 0:
+            return face_tuple[2].get('redraw', {}).get('imageFile', {}).get('options', {}).get('face', None)
+        else:
+            return None
+        
+    def parse_face_v2(self, map, character):
+        face_tuple = self.find_tuple(map[4]['data'], character)
         if not face_tuple:
             return None
         show_mode = face_tuple[2].get('showmode', None)
@@ -57,7 +68,7 @@ class BaseParser:
                     try:
                         character, text_jp, text_en, text_cn, is_diaologe = self.parse_diaologue(map)
                         stage = self.parse_stage(map)
-                        face = self.parse_face(map)
+                        face = self.parse_face_v2(map, character)
                         result.append({
                             'character': character,
                             'text_jp': text_jp,

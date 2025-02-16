@@ -4,21 +4,30 @@ from pygame.locals import *
 from OpenGL.GL import *
 import ctypes
 import time
+import asyncio
+from langserve import RemoteRunnable
+from langchain.schema import HumanMessage
+import requests
+
+rag_agent = RemoteRunnable("http://localhost:8000/chat")
 
 # Simulate OpenAI API streaming response
 import random
 
 def get_text():
-    """ Simulate streaming text from OpenAI API. """
-    messages = [
-        "Hello! Welcome to the Live2D system.",
-        "Pygame supports multiple rendering methods.",
-        "Live2D can create animated characters!",
-        "You can get text from an external source.",
-        "The text box is semi-transparent and supports word wrap.",
-        None  # Simulate no message sometimes
-    ]
-    return random.choice(messages)
+    """
+    从消息服务器拉取下一条消息:
+    - 如果队列中有消息, 返回其字符串内容
+    - 如果队列为空, 返回 None
+    """
+    try:
+        resp = requests.get("http://localhost:9000/pop_message")
+        data = resp.json()
+        msg = data.get("message")
+        return msg  # 可能是字符串或None
+    except Exception as e:
+        print("Failed to get message:", e)
+        return None
 
 # Initialize Pygame and OpenGL
 pygame.init()
@@ -81,7 +90,7 @@ while running:
                 model.SetRandomExpression()
 
     # Fetch new text when current text is cleared
-    if text_full == "" and (text_end_time is None or time.time() - text_end_time > 10):
+    if text_full == "" and (text_end_time is None or time.time() - text_end_time > 2):
         new_text = get_text()
         if new_text:
             text_full = new_text
